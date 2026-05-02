@@ -7,9 +7,9 @@ This repository contains the on-chain logic for two related packages:
 | Package | Purpose |
 | --- | --- |
 | [`exchange-app/`](./exchange-app) | **v2 perpetuals stack**: KYC/KYB, LockedAmulet-style margin, atomic batch settlement, FeaturedAppActivityMarker (V2-shaped) emission, insurance fund. The legacy v1 ROCKY-mining flow (TradeOrder + MiningReward + TokenHolding) is preserved for backward compatibility. |
-| [`my-token/`](./my-token) | A standalone token implementing the Splice `HoldingV1` interface (`splice-api-token-holding-v1`). |
+| [`rocky/`](./rocky) | A standalone token implementing the Splice `HoldingV1` interface (`splice-api-token-holding-v1`). |
 
-The two packages are independent. `my-token` is a separate experiment in implementing the Splice token API.
+The two packages are independent. `rocky` is a separate experiment in implementing the Splice token API.
 
 ## Repository layout
 
@@ -24,7 +24,7 @@ daml-contracts/
 │       │                         FundingRound, Liquidation, FeaturedAppActivityMarker,
 │       │                         InsuranceFund
 │       └── ExchangeApp.daml    -- top-level operator (App Provider) + legacy v1 templates
-├── my-token/
+├── rocky/
 │   ├── daml.yaml
 │   ├── daml/
 │   │   └── MyToken.daml
@@ -35,7 +35,7 @@ daml-contracts/
 ## Prerequisites
 
 - DAML SDK `3.3.0-snapshot.20250415.13756.0.vafc5c867` (matches `sdk-version` in each `daml.yaml`)
-- For `my-token`: the two Splice token-API DARs (see below)
+- For `rocky`: the two Splice token-API DARs (see below)
 
 ## Building
 
@@ -46,19 +46,19 @@ cd exchange-app
 daml build
 ```
 
-### `my-token`
+### `rocky`
 
-`my-token` depends on two DARs from the [Splice](https://github.com/digital-asset/splice) project. They are **not** redistributed here. Drop them into `my-token/dars/` before building:
+`rocky` depends on two DARs from the [Splice](https://github.com/digital-asset/splice) project. They are **not** redistributed here. Drop them into `rocky/dars/` before building:
 
 ```
-my-token/dars/splice-api-token-holding-v1-1.0.0.dar
-my-token/dars/splice-api-token-metadata-v1-1.0.0.dar
+rocky/dars/splice-api-token-holding-v1-1.0.0.dar
+rocky/dars/splice-api-token-metadata-v1-1.0.0.dar
 ```
 
 If you have a local Splice checkout, the DARs typically live at `<splice-root>/daml/dars/`. Once the files are in place:
 
 ```bash
-cd my-token
+cd rocky
 daml build
 ```
 
