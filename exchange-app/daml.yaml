@@ -1,0 +1,9 @@
+sdk-version: 3.3.0-snapshot.20250415.13756.0.vafc5c867
+name: exchange-app-v2
+version: 1.0.2
+source: daml
+dependencies:
+  - daml-prim
+  - daml-stdlib
+build-options:
+  - --target=2.1

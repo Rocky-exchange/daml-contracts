@@ -1,0 +1,20 @@
+# DAML build artifacts
+.daml/
+*.dar
+
+# But keep DAR dependencies users drop in
+!my-token/dars/*.dar
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*~
+
+# Python (in case test scripts are added)
+__pycache__/
+*.pyc
+.venv/

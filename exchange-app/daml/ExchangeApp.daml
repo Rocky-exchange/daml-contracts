@@ -1,0 +1,216 @@
+module ExchangeApp where
+
+import DA.Text (sha256)
+
+-- ============================================================
+-- Exchange App: managed by App Provider
+-- ============================================================
+template ExchangeApp
+  with
+    appProvider : Party
+    appName : Text
+    rewardRate : Decimal          -- ROCKY per USDT (e.g., 1.0)
+    totalRewardsMinted : Decimal
+    maxRewardSupply : Decimal
+  where
+    signatory appProvider
+    ensure rewardRate > 0.0 && maxRewardSupply > 0.0
+
+    -- App Provider records a filled order and generates reward.
+    -- NOTE: This is currently nonconsuming, which means totalRewardsMinted
+    -- is never updated and the supply cap check is effectively static.
+    -- If you reintroduce this choice into the live flow, switch to consuming
+    -- and recreate ExchangeApp with the new totalRewardsMinted. See README.
+    nonconsuming choice RecordTrade : (ContractId TradeOrder, ContractId MiningReward)
+      with
+        trader : Party
+        orderType : Text
+        baseAsset : Text
+        quoteAsset : Text
+        quantity : Decimal
+        price : Decimal
+      controller appProvider
+      do
+        let tradeValue = quantity * price
+        let rewardAmount = tradeValue * rewardRate
+        let orderHash = sha256 (
+              show trader <> show orderType <> show baseAsset
+              <> show quoteAsset <> show quantity <> show price
+              <> show appProvider)
+
+        assertMsg "Reward supply exhausted"
+          (totalRewardsMinted + rewardAmount <= maxRewardSupply)
+
+        orderCid <- create TradeOrder with
+          exchange = appProvider
+          trader
+          orderHash
+          orderType
+          baseAsset
+          quoteAsset
+          quantity
+          price
+          tradeValueUsdt = tradeValue
+
+        rewardCid <- create MiningReward with
+          exchange = appProvider
+          miner = trader
+          rewardAmount
+          orderHash
+          tradeValueUsdt = tradeValue
+          rewardTokenSymbol = "ROCKY"
+
+        return (orderCid, rewardCid)
+
+    choice UpdateRewardRate : ContractId ExchangeApp
+      with
+        newRate : Decimal
+      controller appProvider
+      do
+        assertMsg "Rate must be positive" (newRate > 0.0)
+        create this with rewardRate = newRate
+
+-- ============================================================
+-- Trade Order: on-chain record (only exchange signs)
+-- ============================================================
+template TradeOrder
+  with
+    exchange : Party
+    trader : Party
+    orderHash : Text
+    orderType : Text
+    baseAsset : Text
+    quoteAsset : Text
+    quantity : Decimal
+    price : Decimal
+    tradeValueUsdt : Decimal
+  where
+    signatory exchange
+    observer trader
+
+-- ============================================================
+-- Mining Reward: user claims to mint ROCKY tokens
+-- ============================================================
+template MiningReward
+  with
+    exchange : Party
+    miner : Party
+    rewardAmount : Decimal
+    orderHash : Text
+    tradeValueUsdt : Decimal
+    rewardTokenSymbol : Text
+  where
+    signatory exchange
+    observer miner
+    ensure rewardAmount > 0.0
+
+    -- Authority during this choice = signatory (exchange) + controller (miner),
+    -- which matches TokenHolding's signatories (issuer + owner).
+    choice ClaimReward : ContractId TokenHolding
+      controller miner
+      do
+        create TokenHolding with
+          owner = miner
+          issuer = exchange
+          amount = rewardAmount
+          tokenName = "Rocky"
+          tokenSymbol = rewardTokenSymbol
+          sourceOrderHash = Some orderHash
+
+-- ============================================================
+-- TokenHolding: ROCKY token
+-- ============================================================
+template TokenHolding
+  with
+    owner : Party
+    issuer : Party
+    amount : Decimal
+    tokenName : Text
+    tokenSymbol : Text
+    sourceOrderHash : Optional Text
+  where
+    signatory issuer, owner
+    ensure amount >= 0.0
+
+    -- Cross-party transfer goes through ProposeTransfer + Accept.
+    -- A direct Transfer cannot work here because creating a TokenHolding
+    -- for the receiver would require the receiver's authority, which is
+    -- not present when only owner controls the choice.
+
+    -- Sender locks part of the balance into a PendingTokenHolding which
+    -- the receiver must Accept.
+    choice ProposeTransfer : (ContractId TokenHolding, ContractId PendingTokenHolding)
+      with
+        receiver : Party
+        transferAmount : Decimal
+      controller owner
+      do
+        assertMsg "Amount must be positive" (transferAmount > 0.0)
+        assertMsg "Insufficient balance" (transferAmount <= amount)
+        senderCid <- create this with
+          amount = amount - transferAmount
+          sourceOrderHash = None
+        pendingCid <- create PendingTokenHolding with
+          owner = receiver
+          issuer = issuer
+          sender = owner
+          amount = transferAmount
+          tokenName = tokenName
+          tokenSymbol = tokenSymbol
+        return (senderCid, pendingCid)
+
+    choice MergeHolding : ContractId TokenHolding
+      with
+        otherCid : ContractId TokenHolding
+      controller owner
+      do
+        other <- fetch otherCid
+        assertMsg "Same issuer" (other.issuer == issuer)
+        assertMsg "Same owner" (other.owner == owner)
+        assertMsg "Same token" (other.tokenSymbol == tokenSymbol)
+        archive otherCid
+        create this with
+          amount = amount + other.amount
+          sourceOrderHash = None
+
+-- ============================================================
+-- PendingTokenHolding: receiver-side inbox for cross-party transfers.
+-- Signatory is only the issuer so that ProposeTransfer can create it
+-- without the receiver's authorization. The receiver Accepts to mint a
+-- real TokenHolding; on Reject the holding flips direction so the
+-- original sender can Accept it back.
+-- ============================================================
+template PendingTokenHolding
+  with
+    owner : Party       -- intended receiver
+    issuer : Party
+    sender : Party      -- original sender, kept for display and Reject
+    amount : Decimal
+    tokenName : Text
+    tokenSymbol : Text
+  where
+    signatory issuer
+    observer owner, sender
+    ensure amount >= 0.0
+
+    choice Accept : ContractId TokenHolding
+      controller owner
+      do
+        create TokenHolding with
+          owner = owner
+          issuer = issuer
+          amount = amount
+          tokenName = tokenName
+          tokenSymbol = tokenSymbol
+          sourceOrderHash = None
+
+    choice Reject : ContractId PendingTokenHolding
+      controller owner
+      do
+        create PendingTokenHolding with
+          owner = sender
+          issuer = issuer
+          sender = owner
+          amount = amount
+          tokenName = tokenName
+          tokenSymbol = tokenSymbol

@@ -1,0 +1,134 @@
+module MyToken where
+
+import Splice.Api.Token.MetadataV1 qualified as MetadataV1
+import Splice.Api.Token.HoldingV1 qualified as HoldingV1
+import DA.TextMap qualified as TextMap
+
+-- | A custom token on the Canton Network.
+template MyToken
+  with
+    owner : Party
+    issuer : Party
+    amount : Decimal
+    tokenName : Text
+    tokenSymbol : Text
+  where
+    signatory owner, issuer
+    ensure amount >= 0.0
+
+    interface instance HoldingV1.Holding for MyToken where
+      view = HoldingV1.HoldingView with
+        owner
+        instrumentId = HoldingV1.InstrumentId with
+          admin = issuer
+          id = tokenSymbol
+        amount
+        lock = None
+        meta = MetadataV1.Metadata with
+          values = TextMap.fromList
+            [ ("name", tokenName)
+            , ("symbol", tokenSymbol)
+            , ("decimals", "8")
+            ]
+
+    -- | Lock the entire balance into a TransferProposal that escrows funds
+    -- until the receiver accepts/rejects or the sender cancels.
+    -- Consuming on purpose: prevents proposing the same balance twice.
+    choice ProposeTransfer : ContractId TransferProposal
+      with
+        receiver : Party
+        transferAmount : Decimal
+      controller owner
+      do
+        assertMsg "Transfer amount must be positive" (transferAmount > 0.0)
+        assertMsg "Insufficient balance" (transferAmount <= amount)
+        create TransferProposal with
+          sender = owner
+          issuer
+          receiver
+          transferAmount
+          remainingAmount = amount - transferAmount
+          tokenName
+          tokenSymbol
+
+    -- | Split this holding into two pieces.
+    choice Split : (ContractId MyToken, ContractId MyToken)
+      with
+        splitAmount : Decimal
+      controller owner
+      do
+        assertMsg "Split amount must be positive" (splitAmount > 0.0)
+        assertMsg "Split amount must be less than total" (splitAmount < amount)
+        part1 <- create this with amount = splitAmount
+        part2 <- create this with amount = amount - splitAmount
+        return (part1, part2)
+
+    -- | Merge two same-token holdings owned by the same party.
+    choice Merge : ContractId MyToken
+      with
+        otherCid : ContractId MyToken
+      controller owner
+      do
+        other <- fetch otherCid
+        assertMsg "Same issuer required" (other.issuer == issuer)
+        assertMsg "Same owner required" (other.owner == owner)
+        assertMsg "Same token required" (other.tokenSymbol == tokenSymbol)
+        archive otherCid
+        create this with amount = amount + other.amount
+
+-- | Transfer proposal: the sender's balance is fully locked here until the
+-- proposal is accepted, rejected, or cancelled. Both sender and issuer must
+-- sign so that AcceptTransfer can mint the receiver's MyToken (which needs
+-- issuer authority).
+template TransferProposal
+  with
+    sender : Party
+    receiver : Party
+    issuer : Party
+    transferAmount : Decimal
+    remainingAmount : Decimal
+    tokenName : Text
+    tokenSymbol : Text
+  where
+    signatory sender, issuer
+    observer receiver
+    ensure transferAmount > 0.0 && remainingAmount >= 0.0
+
+    -- | Receiver accepts. Returns the optional sender-remainder holding and
+    -- the receiver's new holding.
+    choice AcceptTransfer : (Optional (ContractId MyToken), ContractId MyToken)
+      controller receiver
+      do
+        senderRemainder <- mintIfPositive sender issuer remainingAmount tokenName tokenSymbol
+        receiverHolding <- create MyToken with
+          owner = receiver
+          issuer
+          amount = transferAmount
+          tokenName
+          tokenSymbol
+        return (senderRemainder, receiverHolding)
+
+    -- | Receiver rejects: full original balance returns to the sender.
+    choice RejectTransfer : Optional (ContractId MyToken)
+      controller receiver
+      do mintIfPositive sender issuer (remainingAmount + transferAmount) tokenName tokenSymbol
+
+    -- | Sender cancels before the receiver responds.
+    choice CancelTransfer : Optional (ContractId MyToken)
+      controller sender
+      do mintIfPositive sender issuer (remainingAmount + transferAmount) tokenName tokenSymbol
+
+-- | Helper: create a MyToken only when amount > 0; otherwise return None.
+mintIfPositive
+  :  Party    -- owner
+  -> Party    -- issuer
+  -> Decimal  -- amount
+  -> Text     -- tokenName
+  -> Text     -- tokenSymbol
+  -> Update (Optional (ContractId MyToken))
+mintIfPositive owner issuer amount tokenName tokenSymbol =
+  if amount > 0.0
+    then do
+      cid <- create MyToken with ..
+      return (Some cid)
+    else return None
