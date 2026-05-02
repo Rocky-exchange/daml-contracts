@@ -156,10 +156,10 @@ TokenHolding (sender remainder) + PendingTokenHolding
 
 `PendingTokenHolding` is the receiver-side inbox pattern: it is signed only by the issuer so the sender can lock funds without the receiver pre-authorising. Reject flips the direction so the original sender can Accept it back.
 
-## MyToken flow
+## Rocky flow
 
 ```
-MyToken (owner)
+Rocky (owner)
    │
    │ ProposeTransfer  (consuming - locks the full balance)
    ▼
