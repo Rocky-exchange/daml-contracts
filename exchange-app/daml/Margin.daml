@@ -1,0 +1,185 @@
+-- ============================================================
+-- KYC / KYB enforcement and LockedAmulet-style margin accounts.
+--
+-- The Rocky Exchange protocol does not allow trading without a fresh
+-- KycCertificate, and traders' margin balances are held in MarginAccounts
+-- co-signed by the operator and the trader. Locked margin against an
+-- open Position is escrowed in LockedMargin, mirroring Splice's
+-- LockedAmulet pattern: only operator-driven settlement / liquidation
+-- choices can release or seize it.
+-- ============================================================
+module Margin where
+
+-- ------------------------------------------------------------
+-- KYC / KYB
+-- ------------------------------------------------------------
+
+data KycLevel
+  = KycIndividual       -- retail KYC
+  | KybInstitutional    -- institutional KYB
+  deriving (Eq, Show)
+
+template KycCertificate
+  with
+    operator     : Party
+    trader       : Party
+    level        : KycLevel
+    jurisdiction : Text          -- ISO-3166 alpha-2, e.g. "SG"
+    issuedAt     : Time
+    expiresAt    : Time
+  where
+    signatory operator
+    observer  trader
+    ensure expiresAt > issuedAt
+
+    choice Revoke : ()
+      controller operator
+      do return ()
+
+    choice Renew : ContractId KycCertificate
+      with newExpiry : Time
+      controller operator
+      do
+        assertMsg "Renewal must extend expiry" (newExpiry > expiresAt)
+        create this with expiresAt = newExpiry
+
+-- | Validates a KYC contract for a given trader at the current ledger time.
+-- Used by every position-opening choice as an on-chain compliance gate.
+fetchValidKyc : Party -> ContractId KycCertificate -> Update KycCertificate
+fetchValidKyc expectedTrader cid = do
+  k <- fetch cid
+  now <- getTime
+  assertMsg "KYC: trader mismatch"   (k.trader == expectedTrader)
+  assertMsg "KYC: certificate expired" (k.expiresAt > now)
+  return k
+
+-- ------------------------------------------------------------
+-- Margin accounts (LockedAmulet pattern)
+-- ------------------------------------------------------------
+
+-- | Per-trader free margin balance, denominated in CC. Co-signed by the
+-- operator and the trader; the operator is the custody party for off-chain
+-- bookkeeping while the trader retains protocol-level control via the
+-- shared signatory authority.
+template MarginAccount
+  with
+    operator    : Party
+    trader      : Party
+    asset       : Text           -- "CC"
+    freeBalance : Decimal
+  where
+    signatory operator, trader
+    ensure freeBalance >= 0.0
+
+    -- Trader-controlled top-up.
+    choice Deposit : ContractId MarginAccount
+      with topUp : Decimal
+      controller trader
+      do
+        assertMsg "Deposit must be positive" (topUp > 0.0)
+        create this with freeBalance = freeBalance + topUp
+
+    -- Trader-controlled withdrawal of free margin.
+    choice Withdraw : ContractId MarginAccount
+      with amount : Decimal
+      controller trader
+      do
+        assertMsg "Withdraw must be positive"  (amount > 0.0)
+        assertMsg "Insufficient free balance"  (amount <= freeBalance)
+        create this with freeBalance = freeBalance - amount
+
+    -- Operator-driven margin lock during BatchSettlement / position open.
+    -- The trader's authority is delegated through their signatory role on
+    -- this account: the LockedMargin we mint requires that authority and
+    -- gets it from the consumed MarginAccount.
+    choice LockForPosition : (ContractId MarginAccount, ContractId LockedMargin)
+      with
+        lockAmount : Decimal
+        market     : Text
+      controller operator
+      do
+        assertMsg "Lock amount must be positive" (lockAmount > 0.0)
+        assertMsg "Insufficient free balance"    (lockAmount <= freeBalance)
+        accCid <- create this with freeBalance = freeBalance - lockAmount
+        lockCid <- create LockedMargin with
+          operator
+          trader
+          market
+          amount = lockAmount
+        return (accCid, lockCid)
+
+    -- Operator-driven settlement delta: applies fee charges, realised P&L,
+    -- and funding payments. Fails if the resulting balance would go
+    -- negative (the trader's free margin is never overdrawn directly;
+    -- losses larger than free margin are absorbed via LockedMargin.Seize
+    -- and routed to the insurance fund).
+    choice ApplyDelta : ContractId MarginAccount
+      with delta : Decimal
+      controller operator
+      do
+        let newBalance = freeBalance + delta
+        assertMsg "Resulting balance would be negative" (newBalance >= 0.0)
+        create this with freeBalance = newBalance
+
+-- | Operator-issued invitation to onboard a trader's MarginAccount.
+-- Trader accepts to materialise the account; this preserves the standard
+-- propose / accept onboarding model without requiring multi-party submission.
+template MarginAccountInvitation
+  with
+    operator : Party
+    trader   : Party
+    asset    : Text
+  where
+    signatory operator
+    observer  trader
+
+    choice AcceptInvitation : ContractId MarginAccount
+      controller trader
+      do
+        create MarginAccount with
+          operator
+          trader
+          asset
+          freeBalance = 0.0
+
+    choice WithdrawInvitation : ()
+      controller operator
+      do return ()
+
+-- | LockedAmulet-style escrow holding margin against an open Position.
+-- Only released by the operator-driven Position lifecycle choices
+-- (close, partial reduce, funding settlement, liquidation).
+template LockedMargin
+  with
+    operator : Party
+    trader   : Party
+    market   : Text
+    amount   : Decimal
+  where
+    signatory operator, trader
+    ensure amount > 0.0
+
+    -- Release the locked amount back to the trader's MarginAccount.
+    -- Used on full position close.
+    choice Release : ContractId MarginAccount
+      with marginAccCid : ContractId MarginAccount
+      controller operator
+      do exercise marginAccCid ApplyDelta with delta = amount
+
+    -- Seize the locked amount on liquidation; the operator routes it to
+    -- the insurance fund and (if applicable) the liquidation engine.
+    choice Seize : Decimal
+      controller operator
+      do return amount
+
+    -- Split a locked margin into two pieces so partial position reduction
+    -- can release a proportional slice while retaining the residue.
+    choice Split : (ContractId LockedMargin, ContractId LockedMargin)
+      with releaseAmount : Decimal
+      controller operator
+      do
+        assertMsg "Release amount must be positive"          (releaseAmount > 0.0)
+        assertMsg "Release amount must be less than total"   (releaseAmount < amount)
+        relCid <- create this with amount = releaseAmount
+        keepCid <- create this with amount = amount - releaseAmount
+        return (relCid, keepCid)

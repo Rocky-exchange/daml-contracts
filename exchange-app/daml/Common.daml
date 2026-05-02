@@ -1,0 +1,43 @@
+-- ============================================================
+-- Common types & helpers for the Rocky Exchange perpetuals stack.
+-- ============================================================
+module Common where
+
+-- | Direction of a perpetual position or trade.
+data Side = Long | Short
+  deriving (Eq, Show)
+
+flipSide : Side -> Side
+flipSide Long  = Short
+flipSide Short = Long
+
+sideMultiplier : Side -> Decimal
+sideMultiplier Long  = 1.0
+sideMultiplier Short = -1.0
+
+-- | A perpetual market symbol, e.g. "BTC-PERP", "ETH-PERP".
+type MarketSymbol = Text
+
+-- | Off-chain match payload for one fill within a BatchSettlement.
+-- This is *data*, not a template: trader-side authorisation is provided
+-- by OrderIntent contracts which the batch consumes atomically.
+data Fill = Fill with
+    market         : MarketSymbol
+    takerSide      : Side
+    quantity       : Decimal
+    price          : Decimal
+    takerOrderHash : Text
+    makerOrderHash : Text
+  deriving (Eq, Show)
+
+-- | Notional value of a fill in CC (quote-asset) units.
+notionalOf : Fill -> Decimal
+notionalOf f = f.quantity * f.price
+
+-- | Apply a basis-points rate to a notional amount.
+bpsOf : Decimal -> Decimal -> Decimal
+bpsOf notional rateBps = notional * rateBps / 10000.0
+
+-- | Wash-trade guard: returns True when taker and maker are the same party.
+isSelfTrade : Party -> Party -> Bool
+isSelfTrade a b = a == b

@@ -1,48 +1,208 @@
+-- ============================================================
+-- Rocky Exchange — top-level operator template (App Provider).
+--
+-- This module is the v2 entry point for the Rocky Exchange perpetuals
+-- DEX described in the Canton Foundation Accelerator (FA) application:
+--
+--   * KYC / KYB enforcement (mandatory)
+--   * LockedAmulet-style margin accounts (`Margin` module)
+--   * Perpetual markets, trader-pre-authorised order intents, atomic
+--     batch settlement, funding, liquidation (`Perpetual` module)
+--   * FeaturedAppActivityMarker (V2-shaped) emission tied to verified
+--     notional, plus a protocol insurance fund (`Perpetual` module)
+--
+-- The legacy v1 ROCKY-mining templates (TradeOrder, MiningReward,
+-- TokenHolding, PendingTokenHolding) are preserved for backward
+-- compatibility with the existing demo scripts on Devnet. New flows
+-- should target the perpetuals stack.
+-- ============================================================
 module ExchangeApp where
 
 import DA.Text (sha256)
+import DA.Time
+
+import Common
+import Margin
+import Perpetual
 
 -- ============================================================
--- Exchange App: managed by App Provider
+-- ExchangeApp: managed by the App Provider (operator).
 -- ============================================================
 template ExchangeApp
   with
-    appProvider : Party
-    appName : Text
-    rewardRate : Decimal          -- ROCKY per USDT (e.g., 1.0)
-    totalRewardsMinted : Decimal
-    maxRewardSupply : Decimal
+    operator               : Party
+    appName                : Text
+    -- Legacy ROCKY-mining parameters (kept for v1 compatibility).
+    rewardRate             : Decimal     -- ROCKY per quote-asset unit
+    totalRewardsMinted     : Decimal
+    maxRewardSupply        : Decimal
+    -- Perpetuals risk parameters.
+    initialMarginRatio     : Decimal     -- e.g. 0.02  (= 50x cap)
+    maintenanceMarginRatio : Decimal     -- e.g. 0.01
+    liquidationFeeBps      : Decimal     -- e.g. 75    (= 0.75 %)
+    insuranceShareBps      : Decimal     -- share of liquidation fee routed to InsuranceFund
+    -- Compliance.
+    kycRequired            : Bool        -- always True on mainnet
   where
-    signatory appProvider
-    ensure rewardRate > 0.0 && maxRewardSupply > 0.0
+    signatory operator
+    ensure rewardRate              > 0.0
+        && maxRewardSupply         > 0.0
+        && initialMarginRatio      > 0.0
+        && maintenanceMarginRatio  > 0.0
+        && maintenanceMarginRatio <= initialMarginRatio
+        && liquidationFeeBps       >= 0.0
+        && insuranceShareBps       >= 0.0
+        && insuranceShareBps       <= 10000.0
 
-    -- App Provider records a filled order and generates reward.
+    -- ----------------------------------------------------------
+    -- Perpetuals factory choices
+    -- ----------------------------------------------------------
+
+    nonconsuming choice CreatePerpetualMarket : ContractId PerpetualMarket
+      with
+        market             : MarketSymbol
+        underlying         : Text
+        maxLeverage        : Decimal
+        takerFeeBps        : Decimal
+        makerFeeBps        : Decimal
+        fundingIntervalSec : Int
+        contractSizeMin    : Decimal
+      controller operator
+      do
+        create PerpetualMarket with
+          operator
+          market
+          underlying
+          quoteAsset = "CC"
+          maxLeverage
+          takerFeeBps
+          makerFeeBps
+          fundingIntervalSec
+          contractSizeMin
+          paused = False
+
+    -- Open a new BatchSettlement commit-point. The off-chain matching
+    -- engine then atomically exercises ProcessFill once per matched fill
+    -- in a single Daml transaction.
+    nonconsuming choice OpenBatch : ContractId BatchSettlement
+      with
+        batchId : Text
+        market  : MarketSymbol
+      controller operator
+      do
+        now <- getTime
+        create BatchSettlement with
+          operator
+          batchId
+          market
+          sequencedAt = now
+
+    -- Issue a KYC / KYB certificate after off-chain verification.
+    -- `validFor` is a relative time (e.g. `days 365`).
+    nonconsuming choice IssueKyc : ContractId KycCertificate
+      with
+        trader       : Party
+        level        : KycLevel
+        jurisdiction : Text
+        validFor     : RelTime
+      controller operator
+      do
+        now <- getTime
+        create KycCertificate with
+          operator
+          trader
+          level
+          jurisdiction
+          issuedAt  = now
+          expiresAt = addRelTime now validFor
+
+    -- Invite a trader to open a CC-denominated MarginAccount. The trader
+    -- accepts the invitation to materialise the account.
+    nonconsuming choice InviteMarginAccount : ContractId MarginAccountInvitation
+      with trader : Party
+      controller operator
+      do
+        create MarginAccountInvitation with
+          operator
+          trader
+          asset = "CC"
+
+    -- Bootstrap the protocol insurance fund (idempotent: caller should
+    -- only run this once at deployment).
+    nonconsuming choice BootstrapInsuranceFund : ContractId InsuranceFund
+      controller operator
+      do
+        create InsuranceFund with
+          operator
+          asset              = "CC"
+          balance            = 0.0
+          totalContributions = 0.0
+          totalDrawdowns     = 0.0
+
+    -- ----------------------------------------------------------
+    -- Risk-parameter governance
+    -- ----------------------------------------------------------
+
+    choice UpdateRiskParameters : ContractId ExchangeApp
+      with
+        newInitialMarginRatio     : Decimal
+        newMaintenanceMarginRatio : Decimal
+        newLiquidationFeeBps      : Decimal
+        newInsuranceShareBps      : Decimal
+      controller operator
+      do
+        assertMsg "Initial margin ratio must be positive"
+          (newInitialMarginRatio > 0.0)
+        assertMsg "Maintenance margin ratio must be positive"
+          (newMaintenanceMarginRatio > 0.0)
+        assertMsg "Maintenance ratio must not exceed initial ratio"
+          (newMaintenanceMarginRatio <= newInitialMarginRatio)
+        assertMsg "Liquidation fee must be non-negative"
+          (newLiquidationFeeBps >= 0.0)
+        assertMsg "Insurance share must be in [0, 10000] bps"
+          (newInsuranceShareBps >= 0.0 && newInsuranceShareBps <= 10000.0)
+        create this with
+          initialMarginRatio     = newInitialMarginRatio
+          maintenanceMarginRatio = newMaintenanceMarginRatio
+          liquidationFeeBps      = newLiquidationFeeBps
+          insuranceShareBps      = newInsuranceShareBps
+
+    choice SetKycRequired : ContractId ExchangeApp
+      with required : Bool
+      controller operator
+      do create this with kycRequired = required
+
+    -- ----------------------------------------------------------
+    -- Legacy v1 ROCKY-mining flow
+    -- ----------------------------------------------------------
+    -- Kept to keep v1 demo scripts (exchange_test*.py) running. New
+    -- mainnet activity earns CC via FeaturedAppActivityMarker, not ROCKY.
     -- NOTE: This is currently nonconsuming, which means totalRewardsMinted
     -- is never updated and the supply cap check is effectively static.
-    -- If you reintroduce this choice into the live flow, switch to consuming
-    -- and recreate ExchangeApp with the new totalRewardsMinted. See README.
+    -- If you reintroduce this choice into a live flow, switch to consuming
+    -- and recreate ExchangeApp with the new totalRewardsMinted.
     nonconsuming choice RecordTrade : (ContractId TradeOrder, ContractId MiningReward)
       with
-        trader : Party
-        orderType : Text
-        baseAsset : Text
+        trader     : Party
+        orderType  : Text
+        baseAsset  : Text
         quoteAsset : Text
-        quantity : Decimal
-        price : Decimal
-      controller appProvider
+        quantity   : Decimal
+        price      : Decimal
+      controller operator
       do
-        let tradeValue = quantity * price
+        let tradeValue   = quantity * price
         let rewardAmount = tradeValue * rewardRate
-        let orderHash = sha256 (
+        let orderHash    = sha256 (
               show trader <> show orderType <> show baseAsset
               <> show quoteAsset <> show quantity <> show price
-              <> show appProvider)
+              <> show operator)
 
         assertMsg "Reward supply exhausted"
           (totalRewardsMinted + rewardAmount <= maxRewardSupply)
 
         orderCid <- create TradeOrder with
-          exchange = appProvider
+          exchange       = operator
           trader
           orderHash
           orderType
@@ -53,55 +213,54 @@ template ExchangeApp
           tradeValueUsdt = tradeValue
 
         rewardCid <- create MiningReward with
-          exchange = appProvider
-          miner = trader
+          exchange          = operator
+          miner             = trader
           rewardAmount
           orderHash
-          tradeValueUsdt = tradeValue
+          tradeValueUsdt    = tradeValue
           rewardTokenSymbol = "ROCKY"
 
         return (orderCid, rewardCid)
 
     choice UpdateRewardRate : ContractId ExchangeApp
-      with
-        newRate : Decimal
-      controller appProvider
+      with newRate : Decimal
+      controller operator
       do
         assertMsg "Rate must be positive" (newRate > 0.0)
         create this with rewardRate = newRate
 
 -- ============================================================
--- Trade Order: on-chain record (only exchange signs)
+-- Trade Order (legacy v1): on-chain record, only exchange signs.
 -- ============================================================
 template TradeOrder
   with
-    exchange : Party
-    trader : Party
-    orderHash : Text
-    orderType : Text
-    baseAsset : Text
-    quoteAsset : Text
-    quantity : Decimal
-    price : Decimal
+    exchange       : Party
+    trader         : Party
+    orderHash      : Text
+    orderType      : Text
+    baseAsset      : Text
+    quoteAsset     : Text
+    quantity       : Decimal
+    price          : Decimal
     tradeValueUsdt : Decimal
   where
     signatory exchange
-    observer trader
+    observer  trader
 
 -- ============================================================
--- Mining Reward: user claims to mint ROCKY tokens
+-- Mining Reward (legacy v1): user claims to mint ROCKY tokens.
 -- ============================================================
 template MiningReward
   with
-    exchange : Party
-    miner : Party
-    rewardAmount : Decimal
-    orderHash : Text
-    tradeValueUsdt : Decimal
+    exchange          : Party
+    miner             : Party
+    rewardAmount      : Decimal
+    orderHash         : Text
+    tradeValueUsdt    : Decimal
     rewardTokenSymbol : Text
   where
     signatory exchange
-    observer miner
+    observer  miner
     ensure rewardAmount > 0.0
 
     -- Authority during this choice = signatory (exchange) + controller (miner),
@@ -110,23 +269,23 @@ template MiningReward
       controller miner
       do
         create TokenHolding with
-          owner = miner
-          issuer = exchange
-          amount = rewardAmount
-          tokenName = "Rocky"
-          tokenSymbol = rewardTokenSymbol
+          owner           = miner
+          issuer          = exchange
+          amount          = rewardAmount
+          tokenName       = "Rocky"
+          tokenSymbol     = rewardTokenSymbol
           sourceOrderHash = Some orderHash
 
 -- ============================================================
--- TokenHolding: ROCKY token
+-- TokenHolding (legacy v1): ROCKY governance token.
 -- ============================================================
 template TokenHolding
   with
-    owner : Party
-    issuer : Party
-    amount : Decimal
-    tokenName : Text
-    tokenSymbol : Text
+    owner           : Party
+    issuer          : Party
+    amount          : Decimal
+    tokenName       : Text
+    tokenSymbol     : Text
     sourceOrderHash : Optional Text
   where
     signatory issuer, owner
@@ -141,76 +300,75 @@ template TokenHolding
     -- the receiver must Accept.
     choice ProposeTransfer : (ContractId TokenHolding, ContractId PendingTokenHolding)
       with
-        receiver : Party
+        receiver       : Party
         transferAmount : Decimal
       controller owner
       do
-        assertMsg "Amount must be positive" (transferAmount > 0.0)
-        assertMsg "Insufficient balance" (transferAmount <= amount)
+        assertMsg "Amount must be positive"  (transferAmount > 0.0)
+        assertMsg "Insufficient balance"     (transferAmount <= amount)
         senderCid <- create this with
-          amount = amount - transferAmount
+          amount          = amount - transferAmount
           sourceOrderHash = None
         pendingCid <- create PendingTokenHolding with
-          owner = receiver
-          issuer = issuer
-          sender = owner
-          amount = transferAmount
-          tokenName = tokenName
-          tokenSymbol = tokenSymbol
+          owner       = receiver
+          issuer      = issuer
+          sender      = owner
+          amount      = transferAmount
+          tokenName
+          tokenSymbol
         return (senderCid, pendingCid)
 
     choice MergeHolding : ContractId TokenHolding
-      with
-        otherCid : ContractId TokenHolding
+      with otherCid : ContractId TokenHolding
       controller owner
       do
         other <- fetch otherCid
         assertMsg "Same issuer" (other.issuer == issuer)
-        assertMsg "Same owner" (other.owner == owner)
-        assertMsg "Same token" (other.tokenSymbol == tokenSymbol)
+        assertMsg "Same owner"  (other.owner  == owner)
+        assertMsg "Same token"  (other.tokenSymbol == tokenSymbol)
         archive otherCid
         create this with
-          amount = amount + other.amount
+          amount          = amount + other.amount
           sourceOrderHash = None
 
 -- ============================================================
--- PendingTokenHolding: receiver-side inbox for cross-party transfers.
--- Signatory is only the issuer so that ProposeTransfer can create it
--- without the receiver's authorization. The receiver Accepts to mint a
--- real TokenHolding; on Reject the holding flips direction so the
--- original sender can Accept it back.
+-- PendingTokenHolding (legacy v1): receiver-side inbox for cross-party
+-- transfers. Signatory is only the issuer so that ProposeTransfer can
+-- create it without the receiver's authorisation. The receiver Accepts
+-- to mint a real TokenHolding; on Reject the holding flips direction so
+-- the original sender can Accept it back.
 -- ============================================================
 template PendingTokenHolding
   with
-    owner : Party       -- intended receiver
-    issuer : Party
-    sender : Party      -- original sender, kept for display and Reject
-    amount : Decimal
-    tokenName : Text
+    owner       : Party        -- intended receiver
+    issuer      : Party
+    sender      : Party        -- original sender, kept for display and Reject
+    amount      : Decimal
+    tokenName   : Text
     tokenSymbol : Text
   where
     signatory issuer
-    observer owner, sender
+    observer  owner, sender
     ensure amount >= 0.0
 
     choice Accept : ContractId TokenHolding
       controller owner
       do
         create TokenHolding with
-          owner = owner
-          issuer = issuer
-          amount = amount
-          tokenName = tokenName
-          tokenSymbol = tokenSymbol
+          owner           = owner
+          issuer          = issuer
+          amount          = amount
+          tokenName       = tokenName
+          tokenSymbol     = tokenSymbol
           sourceOrderHash = None
 
     choice Reject : ContractId PendingTokenHolding
       controller owner
       do
         create PendingTokenHolding with
-          owner = sender
-          issuer = issuer
-          sender = owner
-          amount = amount
-          tokenName = tokenName
-          tokenSymbol = tokenSymbol
+          owner       = sender
+          issuer      = issuer
+          sender      = owner
+          amount      = amount
+          tokenName
+          tokenSymbol

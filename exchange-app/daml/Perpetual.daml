@@ -1,0 +1,503 @@
+-- ============================================================
+-- Rocky Exchange perpetual-futures core: markets, order intents,
+-- positions, atomic batch settlement, funding, liquidation,
+-- FeaturedAppActivityMarker (V2-shaped) emission, and the
+-- protocol insurance fund.
+--
+-- Architecture summary (per the FA application):
+--   * Off-chain Rust matching engine sequences fills and submits an
+--     atomic Daml transaction that exercises BatchSettlement.ProcessFill
+--     N times, hitting the documented 8-15:1 batching ratio.
+--   * Each fill consumes pre-authorised OrderIntent contracts (signed
+--     operator + trader); the trader-side state mutation (margin lock,
+--     fee charge, Position open, FeaturedAppActivityMarker emission)
+--     happens inside `OrderIntent.Match` so that the trader's signatory
+--     authority is in scope when the new Position is created. The
+--     batch-level guards (wash-trade, opposing sides, fill <= intent
+--     quantity, KYC freshness) live in `BatchSettlement.ProcessFill`.
+--   * Funding rounds and liquidations route through the InsuranceFund.
+-- ============================================================
+module Perpetual where
+
+import Common
+import Margin
+
+-- ------------------------------------------------------------
+-- Per-market configuration
+-- ------------------------------------------------------------
+
+template PerpetualMarket
+  with
+    operator           : Party
+    market             : MarketSymbol     -- "BTC-PERP"
+    underlying         : Text             -- "BTC"
+    quoteAsset         : Text             -- "CC"
+    maxLeverage        : Decimal          -- e.g. 50.0
+    takerFeeBps        : Decimal          -- 2.5
+    makerFeeBps        : Decimal          -- 0.5  (positive = fee, negative = rebate)
+    fundingIntervalSec : Int              -- 28800 (8h)
+    contractSizeMin    : Decimal
+    paused             : Bool
+  where
+    signatory operator
+    ensure maxLeverage > 0.0
+        && takerFeeBps  >= 0.0
+        && fundingIntervalSec > 0
+        && contractSizeMin > 0.0
+
+    choice Pause : ContractId PerpetualMarket
+      controller operator
+      do create this with paused = True
+
+    choice Resume : ContractId PerpetualMarket
+      controller operator
+      do create this with paused = False
+
+    choice UpdateFees : ContractId PerpetualMarket
+      with
+        newTakerBps : Decimal
+        newMakerBps : Decimal
+      controller operator
+      do
+        assertMsg "Taker fee must be non-negative" (newTakerBps >= 0.0)
+        create this with
+          takerFeeBps = newTakerBps
+          makerFeeBps = newMakerBps
+
+-- ------------------------------------------------------------
+-- FeaturedAppActivityMarker (V2-shaped)
+--
+-- Mirrors the structure of `FeaturedAppActivityMarker` from
+-- `splice-amulet`. Once the splice-featured-app DAR is added as a
+-- data-dependency, this template can implement the V2 interface without
+-- changing call-sites.
+-- ------------------------------------------------------------
+
+template FeaturedAppActivityMarker
+  with
+    operator      : Party        -- featured app provider
+    beneficiary   : Party        -- credited party (taker / maker / operator / insurance)
+    market        : MarketSymbol
+    notional      : Decimal      -- *verified* notional in CC
+    role          : Text         -- "TAKER" | "MAKER" | "OPERATOR" | "INSURANCE"
+    settlementRef : Text         -- BatchSettlement id
+    recordedAt    : Time
+  where
+    signatory operator
+    observer  beneficiary
+    ensure notional >= 0.0
+
+-- ------------------------------------------------------------
+-- Open positions
+-- ------------------------------------------------------------
+
+template Position
+  with
+    operator        : Party
+    trader          : Party
+    market          : MarketSymbol
+    side            : Side
+    size            : Decimal
+    entryPrice      : Decimal
+    marginLockedCid : ContractId LockedMargin
+    realizedPnl     : Decimal
+    openedAt        : Time
+    lastFundingTs   : Time
+  where
+    signatory operator, trader
+    ensure size > 0.0 && entryPrice > 0.0
+
+    -- Reduce (or fully close) a position at `markPrice`. Realised P&L is
+    -- credited / debited to the trader's MarginAccount; locked margin is
+    -- released proportionally on partial closes and entirely on full close.
+    choice ReducePosition : Optional (ContractId Position)
+      with
+        closeSize    : Decimal
+        markPrice    : Decimal
+        marginAccCid : ContractId MarginAccount
+      controller operator
+      do
+        assertMsg "Close size must be positive"        (closeSize > 0.0)
+        assertMsg "Close size cannot exceed position"  (closeSize <= size)
+        assertMsg "Mark price must be positive"        (markPrice > 0.0)
+
+        let pnl = sideMultiplier side * closeSize * (markPrice - entryPrice)
+        if closeSize == size
+          then do
+            -- Full close: release all locked margin, then apply realised P&L.
+            accAfterRelease <- exercise marginLockedCid Release with marginAccCid
+            _ <- exercise accAfterRelease ApplyDelta with delta = pnl
+            return None
+          else do
+            -- Partial close: split locked margin proportionally, release
+            -- the freed slice, retain the residue against the new Position.
+            lock <- fetch marginLockedCid
+            let releaseAmt = lock.amount * closeSize / size
+            (relLockCid, keepLockCid) <-
+              exercise marginLockedCid Split with releaseAmount = releaseAmt
+            accAfterRelease <- exercise relLockCid Release with marginAccCid
+            _ <- exercise accAfterRelease ApplyDelta with delta = pnl
+            now <- getTime
+            newPosCid <- create this with
+              size            = size - closeSize
+              realizedPnl     = realizedPnl + pnl
+              marginLockedCid = keepLockCid
+              lastFundingTs   = now
+            return (Some newPosCid)
+
+    -- Funding settlement: positive delta credits the trader, negative debits.
+    choice ApplyFunding : ContractId Position
+      with
+        fundingDelta : Decimal
+        appliedAt    : Time
+        marginAccCid : ContractId MarginAccount
+      controller operator
+      do
+        _ <- exercise marginAccCid ApplyDelta with delta = fundingDelta
+        create this with lastFundingTs = appliedAt
+
+    -- Liquidation: full close at the bankruptcy / mark price; locked
+    -- margin is seized and the seized amount + liquidation fee is
+    -- routed to the InsuranceFund. The operator drives the route in
+    -- the same Daml transaction (atomic with the seizure).
+    choice Liquidate : (ContractId Liquidation, ContractId InsuranceFund)
+      with
+        markPrice         : Decimal
+        liquidationFeeBps : Decimal
+        occurredAt        : Time
+        insuranceFundCid  : ContractId InsuranceFund
+      controller operator
+      do
+        seized <- exercise marginLockedCid Seize
+        let liqFee = bpsOf (size * markPrice) liquidationFeeBps
+        ifCid' <- exercise insuranceFundCid Contribute with
+          amount = seized + liqFee
+        liqCid <- create Liquidation with
+          operator
+          trader
+          market
+          side
+          size
+          markPrice
+          seizedMargin   = seized
+          liquidationFee = liqFee
+          occurredAt
+        return (liqCid, ifCid')
+
+-- | Audit record for liquidations. Operator signs; trader observes.
+template Liquidation
+  with
+    operator       : Party
+    trader         : Party
+    market         : MarketSymbol
+    side           : Side
+    size           : Decimal
+    markPrice      : Decimal
+    seizedMargin   : Decimal
+    liquidationFee : Decimal
+    occurredAt     : Time
+  where
+    signatory operator
+    observer  trader
+
+-- | Operator-recorded funding round per market. The off-chain batch driver
+-- exercises Position.ApplyFunding using rate * markPrice * size for each
+-- open position in the same transaction.
+template FundingRound
+  with
+    operator       : Party
+    market         : MarketSymbol
+    fundingRateBps : Decimal       -- signed; positive = longs pay shorts
+    indexPrice     : Decimal
+    roundAt        : Time
+  where
+    signatory operator
+    ensure indexPrice > 0.0
+
+-- ------------------------------------------------------------
+-- Insurance fund
+-- ------------------------------------------------------------
+
+template InsuranceFund
+  with
+    operator           : Party
+    asset              : Text       -- "CC"
+    balance            : Decimal
+    totalContributions : Decimal
+    totalDrawdowns     : Decimal
+  where
+    signatory operator
+    ensure balance >= 0.0
+
+    choice Contribute : ContractId InsuranceFund
+      with amount : Decimal
+      controller operator
+      do
+        assertMsg "Contribution must be positive" (amount > 0.0)
+        create this with
+          balance            = balance            + amount
+          totalContributions = totalContributions + amount
+
+    choice Drawdown : ContractId InsuranceFund
+      with amount : Decimal
+      controller operator
+      do
+        assertMsg "Drawdown must be positive"      (amount > 0.0)
+        assertMsg "Insufficient insurance balance" (amount <= balance)
+        create this with
+          balance        = balance        - amount
+          totalDrawdowns = totalDrawdowns + amount
+
+-- ------------------------------------------------------------
+-- Trader-pre-authorised order intents
+-- ------------------------------------------------------------
+
+-- | Per-side state mutation result returned by `OrderIntent.Match`.
+data MatchResult = MatchResult with
+    marginAccount  : ContractId MarginAccount
+    position       : ContractId Position
+    activityMarker : ContractId FeaturedAppActivityMarker
+
+-- | Multi-party-signed order intent. Trader and operator co-sign at
+-- submission time (multi-party command from the matching-engine front
+-- door), which gives the operator authority to consume the intent inside
+-- a BatchSettlement without further trader interaction.
+--
+-- The trader-side state mutations (margin lock, fee debit, Position
+-- create, FeaturedAppActivityMarker create) all happen inside the
+-- `Match` choice's body so that the trader's signatory authority is in
+-- scope when the new Position contract is created.
+template OrderIntent
+  with
+    operator     : Party
+    trader       : Party
+    market       : MarketSymbol
+    side         : Side
+    quantity     : Decimal
+    limitPrice   : Decimal
+    isReduceOnly : Bool
+    submittedAt  : Time
+    expiresAt    : Time
+  where
+    signatory operator, trader
+    ensure quantity   > 0.0
+        && limitPrice > 0.0
+        && expiresAt  > submittedAt
+
+    -- Operator-driven consumption inside BatchSettlement.ProcessFill.
+    choice Match : MatchResult
+      with
+        marketCid          : ContractId PerpetualMarket
+        marginAccCid       : ContractId MarginAccount
+        kycCid             : ContractId KycCertificate
+        fillPrice          : Decimal
+        fillQuantity       : Decimal
+        initialMarginRatio : Decimal
+        feeBps             : Decimal
+        role               : Text          -- "TAKER" or "MAKER"
+        settlementRef      : Text
+      controller operator
+      do
+        -- Compliance gate.
+        _ <- fetchValidKyc trader kycCid
+
+        mkt <- fetch marketCid
+        assertMsg "OrderIntent.Match: market mismatch with intent"
+          (mkt.market == market)
+        assertMsg "OrderIntent.Match: market is paused"
+          (not mkt.paused)
+        assertMsg "OrderIntent.Match: leverage exceeds market cap"
+          (1.0 / initialMarginRatio <= mkt.maxLeverage)
+        assertMsg "OrderIntent.Match: fill below contract minimum"
+          (fillQuantity >= mkt.contractSizeMin)
+
+        now <- getTime
+        assertMsg "OrderIntent.Match: intent expired"
+          (expiresAt > now)
+        assertMsg "OrderIntent.Match: fill quantity exceeds intent"
+          (fillQuantity <= quantity)
+        assertMsg "OrderIntent.Match: fill price must be positive"
+          (fillPrice > 0.0)
+
+        -- Limit-price respect (taker price improvement is allowed).
+        case side of
+          Long  -> assertMsg "OrderIntent.Match: long fill price exceeds limit"
+                     (fillPrice <= limitPrice)
+          Short -> assertMsg "OrderIntent.Match: short fill price below limit"
+                     (fillPrice >= limitPrice)
+
+        let notional  = fillQuantity * fillPrice
+        let marginReq = notional * initialMarginRatio
+        let feeAmt    = bpsOf notional feeBps
+
+        -- Lock margin and debit fee.
+        (acc1, lockCid) <- exercise marginAccCid LockForPosition with
+          lockAmount = marginReq
+          market     = market
+        acc2 <- exercise acc1 ApplyDelta with delta = (- feeAmt)
+
+        -- Open the position (signatories operator + trader; trader
+        -- authority is delegated through this OrderIntent).
+        posCid <- create Position with
+          operator
+          trader
+          market
+          side
+          size            = fillQuantity
+          entryPrice      = fillPrice
+          marginLockedCid = lockCid
+          realizedPnl     = 0.0
+          openedAt        = now
+          lastFundingTs   = now
+
+        -- Reward marker tied to *verified* notional, not raw trade-count.
+        markerCid <- create FeaturedAppActivityMarker with
+          operator
+          beneficiary   = trader
+          market
+          notional
+          role
+          settlementRef
+          recordedAt    = now
+
+        return MatchResult with
+          marginAccount  = acc2
+          position       = posCid
+          activityMarker = markerCid
+
+    -- Trader can withdraw the intent any time before it is matched.
+    choice Cancel : ()
+      controller trader
+      do return ()
+
+-- ------------------------------------------------------------
+-- Atomic batch settlement (the heart)
+-- ------------------------------------------------------------
+
+-- | Result bundle returned by BatchSettlement.ProcessFill. Used by the
+-- off-chain batch driver to chain follow-up exercises within the same
+-- Daml transaction.
+data BatchFillResult = BatchFillResult with
+    takerMargin   : ContractId MarginAccount
+    makerMargin   : ContractId MarginAccount
+    takerPosition : ContractId Position
+    makerPosition : ContractId Position
+    takerMarker   : ContractId FeaturedAppActivityMarker
+    makerMarker   : ContractId FeaturedAppActivityMarker
+
+-- | An open BatchSettlement is the operator's commit-point for a batch
+-- of off-chain matched fills. Each fill is processed via the
+-- nonconsuming `ProcessFill` choice; atomicity comes from the underlying
+-- Daml transaction (any aborted ProcessFill rolls back the whole batch,
+-- delivering the documented all-or-nothing semantics).
+template BatchSettlement
+  with
+    operator    : Party
+    batchId     : Text
+    market      : MarketSymbol
+    sequencedAt : Time
+  where
+    signatory operator
+
+    nonconsuming choice ProcessFill : BatchFillResult
+      with
+        marketCid          : ContractId PerpetualMarket
+        takerIntentCid     : ContractId OrderIntent
+        makerIntentCid     : ContractId OrderIntent
+        takerMarginCid     : ContractId MarginAccount
+        makerMarginCid     : ContractId MarginAccount
+        takerKycCid        : ContractId KycCertificate
+        makerKycCid        : ContractId KycCertificate
+        fill               : Fill
+        initialMarginRatio : Decimal
+      controller operator
+      do
+        mkt <- fetch marketCid
+        assertMsg "BatchSettlement: batch market mismatch"
+          (market == fill.market)
+        assertMsg "BatchSettlement: market mismatch (config)"
+          (mkt.market == fill.market)
+
+        takerIntent <- fetch takerIntentCid
+        makerIntent <- fetch makerIntentCid
+
+        -- Layer-1 wash-trade guard (Layer-2 = Rust engine; Layer-3 =
+        -- KYC inside OrderIntent.Match).
+        assertMsg "BatchSettlement: wash-trade detected"
+          (not (isSelfTrade takerIntent.trader makerIntent.trader))
+        assertMsg "BatchSettlement: market mismatch (taker intent)"
+          (takerIntent.market == fill.market)
+        assertMsg "BatchSettlement: market mismatch (maker intent)"
+          (makerIntent.market == fill.market)
+        assertMsg "BatchSettlement: intent sides must oppose"
+          (flipSide takerIntent.side == makerIntent.side)
+        assertMsg "BatchSettlement: taker side must match fill"
+          (takerIntent.side == fill.takerSide)
+        assertMsg "BatchSettlement: initial margin ratio out of range"
+          (initialMarginRatio > 0.0 && initialMarginRatio <= 1.0)
+
+        -- Delegate per-side state to OrderIntent.Match (where the
+        -- trader's signatory authority is in scope for Position create).
+        takerRes <- exercise takerIntentCid Match with
+          marketCid
+          marginAccCid       = takerMarginCid
+          kycCid             = takerKycCid
+          fillPrice          = fill.price
+          fillQuantity       = fill.quantity
+          initialMarginRatio
+          feeBps             = mkt.takerFeeBps
+          role               = "TAKER"
+          settlementRef      = batchId
+
+        makerRes <- exercise makerIntentCid Match with
+          marketCid
+          marginAccCid       = makerMarginCid
+          kycCid             = makerKycCid
+          fillPrice          = fill.price
+          fillQuantity       = fill.quantity
+          initialMarginRatio
+          feeBps             = mkt.makerFeeBps
+          role               = "MAKER"
+          settlementRef      = batchId
+
+        return BatchFillResult with
+          takerMargin   = takerRes.marginAccount
+          makerMargin   = makerRes.marginAccount
+          takerPosition = takerRes.position
+          makerPosition = makerRes.position
+          takerMarker   = takerRes.activityMarker
+          makerMarker   = makerRes.activityMarker
+
+    -- Operator-side activity marker for the protocol's own share of fees.
+    nonconsuming choice MarkOperatorRevenue : ContractId FeaturedAppActivityMarker
+      with notional : Decimal
+      controller operator
+      do
+        now <- getTime
+        create FeaturedAppActivityMarker with
+          operator
+          beneficiary   = operator
+          market
+          notional
+          role          = "OPERATOR"
+          settlementRef = batchId
+          recordedAt    = now
+
+    -- Insurance-fund activity marker for liquidation-surplus contributions.
+    nonconsuming choice MarkInsuranceContribution : ContractId FeaturedAppActivityMarker
+      with notional : Decimal
+      controller operator
+      do
+        now <- getTime
+        create FeaturedAppActivityMarker with
+          operator
+          beneficiary   = operator
+          market
+          notional
+          role          = "INSURANCE"
+          settlementRef = batchId
+          recordedAt    = now
+
+    choice CloseBatch : ()
+      controller operator
+      do return ()
